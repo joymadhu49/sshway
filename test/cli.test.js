@@ -20,7 +20,7 @@ function workspace(t) {
 test('add creates native SSH config and preserves existing entries', t => {
   const { home, run } = workspace(t);
   fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
-  fs.writeFileSync(path.join(home, '.ssh/config'), 'Host old\n    HostName old.example.com\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(home, '.ssh/config'), 'ServerAliveInterval 17\nHost old\n    HostName old.example.com\n', { mode: 0o600 });
   const added = run('add', 'mini', 'joy@mini.example.com', '--port', '2222');
   assert.equal(added.status, 0, added.stderr);
   const main = fs.readFileSync(path.join(home, '.ssh/config'), 'utf8');
@@ -36,6 +36,11 @@ test('add creates native SSH config and preserves existing entries', t => {
   assert.match(resolved.stdout, /^hostname mini.example.com$/m);
   assert.match(resolved.stdout, /^user joy$/m);
   assert.match(resolved.stdout, /^port 2222$/m);
+  assert.match(resolved.stdout, /^serveraliveinterval 17$/m);
+  const old = spawnSync('ssh', ['-F', absoluteMain, '-G', 'old'], { encoding: 'utf8' });
+  assert.equal(old.status, 0, old.stderr);
+  assert.match(old.stdout, /^hostname old.example.com$/m);
+  assert.match(old.stdout, /^serveraliveinterval 17$/m);
   assert.match(run('list').stdout, /mini\tjoy@mini.example.com:2222/);
 });
 
