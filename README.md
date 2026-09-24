@@ -1,22 +1,25 @@
 # sshway
 
+[![CI](https://github.com/joymadhu49/sshway/actions/workflows/ci.yml/badge.svg)](https://github.com/joymadhu49/sshway/actions/workflows/ci.yml)
+
 Give SSH connections memorable names. `sshway` writes ordinary OpenSSH configuration, so the names also work with `ssh`, `scp`, `sftp`, Git, and tools that use SSH.
 
-It supports macOS and Linux. It needs Node.js 20 or newer to manage hosts, plus OpenSSH to connect. It has no runtime npm dependencies, server, account, or password store. Tailscale is optional; a DNS name or IP address also works.
+It supports macOS and Linux. It needs Node.js 22 or newer to manage hosts, plus OpenSSH to connect. It has no runtime npm dependencies, server, account, or password store. Tailscale is optional; a DNS name or IP address also works.
 
-## Install from this project
+## Install
 
 ```sh
+git clone https://github.com/joymadhu49/sshway.git
 cd sshway
 pnpm add --global .
 ```
 
-People without pnpm can use `npm install --global .` from the checkout. During development, run `node bin/sshway.js` without installing it. The package has not been published to npm.
+Without pnpm, run `npm install --global .` from the checkout. The GitHub release also provides a package archive that can be installed with `pnpm add --global ./sshway-0.1.0.tgz` after downloading it. The package is not published to npm.
 
 ## Save a host
 
 ```sh
-sshway add mini alex@mini.example.ts.net
+sshway add mini alex@mini.example.com
 ssh mini
 ```
 
@@ -42,7 +45,7 @@ This creates `~/.local/bin/mini`. That directory must be on your `PATH`. If it i
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`sshway` refuses to replace a different command already on `PATH`. The shortcut simply runs `ssh mini` and passes through any extra arguments.
+`sshway` refuses to replace a different executable already on `PATH`. The shortcut simply runs `ssh mini` and passes through any extra arguments. If a shell alias or function already uses that name, choose another name or remove the conflict yourself.
 
 ## Other commands
 
