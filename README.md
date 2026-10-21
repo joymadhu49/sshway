@@ -16,6 +16,24 @@ pnpm add --global .
 
 Without pnpm, run `npm install --global .` from the checkout. The GitHub release also provides a package archive that can be installed with `pnpm add --global ./sshway-<version>.tgz` after downloading it. The package is not published to npm.
 
+## Update
+
+```sh
+sshway update
+```
+
+For a checkout installed with `pnpm add --global .` or `npm install --global .`, this runs `git pull --ff-only` in the checkout, which the global command links to. It stops if the checkout has local changes. For an install from a release archive, it downloads the newest release, checks its SHA-256 checksum, and installs it with the same package manager. Both then run `sshway refresh`, which rewrites the generated SSH config and upgrades one-word commands that `sshway` created.
+
+Version 0.1.0 has no `update` command, so update it once by hand:
+
+```sh
+cd sshway        # the checkout you installed from
+git pull
+sshway refresh
+```
+
+If you installed 0.1.0 from a release archive, download the newest `sshway-<version>.tgz` from the GitHub releases page, run `pnpm add --global ./sshway-<version>.tgz` (or `npm install --global` with the same file), then run `sshway refresh`. Afterwards, `sshway update` handles future versions.
+
 ## Save a host
 
 ```sh
@@ -88,6 +106,8 @@ sshway list
 sshway connect mini
 sshway connect mini -- uptime
 sshway set mini --no-lan --no-reuse
+sshway network
+sshway update
 sshway remove mini
 sshway --help
 ```

@@ -222,3 +222,102 @@ test('status reports the route and connect time', async t => {
   assert.match(result.stdout, new RegExp(`^Route: 127\\.0\\.0\\.1 port ${server.address().port}$`, 'm'));
   assert.match(result.stdout, /^Reachable: TCP connect in \d+ ms\.$/m);
 });
+
+function copyPackage(target, version) {
+  fs.mkdirSync(target, { recursive: true });
+  for (const item of ['bin', 'lib', 'README.md', 'LICENSE']) fs.cpSync(path.resolve(__dirname, '..', item), path.join(target, item), { recursive: true });
+  const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../package.json'), 'utf8'));
+  fs.writeFileSync(path.join(target, 'package.json'), `${JSON.stringify({ ...pkg, version }, null, 2)}\n`);
+}
+
+function execCli(file, args, env) {
+  return new Promise(resolve => {
+    require('node:child_process').execFile(process.execPath, [file, ...args], { env }, (error, stdout, stderr) => {
+      resolve({ status: error ? error.code : 0, stdout, stderr });
+    });
+  });
+}
+
+test('update pulls a linked git checkout and refreshes old shortcuts', async t => {
+  const { home } = workspace(t);
+  const git = (cwd, ...args) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' } });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  const origin = path.join(home, 'origin');
+  copyPackage(origin, '0.1.0');
+  git(origin, 'init', '-q');
+  git(origin, 'add', '.');
+  git(origin, 'commit', '-qm', 'old');
+  const checkout = path.join(home, 'checkout');
+  git(home, 'clone', '-q', origin, checkout);
+  copyPackage(origin, '0.9.0');
+  git(origin, 'commit', '-qam', 'new');
+
+  const env = { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
+  const cli = path.join(checkout, 'bin/sshway.js');
+  assert.equal(spawnSync(process.execPath, [cli, 'add', 'mini', 'joy@mini.example.com'], { env }).status, 0);
+  const shortcut = path.join(home, '.local/bin/mini');
+  fs.mkdirSync(path.dirname(shortcut), { recursive: true });
+  fs.writeFileSync(shortcut, '#!/bin/sh\n# sshway managed shortcut\nexec ssh mini "$@"\n', { mode: 0o755 });
+
+  fs.appendFileSync(path.join(checkout, 'README.md'), 'local edit\n');
+  const dirty = await execCli(cli, ['update'], env);
+  assert.equal(dirty.status, 1);
+  assert.match(dirty.stderr, /has local changes/);
+  git(checkout, 'checkout', '--', 'README.md');
+
+  const updated = await execCli(cli, ['update'], env);
+  assert.equal(updated.status, 0, updated.stderr);
+  assert.match(updated.stdout, /Upgraded shortcuts: mini\./);
+  assert.match(updated.stdout, /Updated sshway 0\.1\.0 to 0\.9\.0\./);
+  assert.match(fs.readFileSync(shortcut, 'utf8'), /ssh -G mini/);
+  assert.match((await execCli(cli, ['update'], env)).stdout, /0\.9\.0 is already the newest version/);
+});
+
+test('update installs a verified release archive', async t => {
+  const { home } = workspace(t);
+  const installed = path.join(home, 'installed');
+  copyPackage(installed, '0.1.0');
+  const source = path.join(home, 'source');
+  copyPackage(source, '0.9.0');
+  const packed = spawnSync('npm', ['pack', '--silent', '--pack-destination', home], { cwd: source, encoding: 'utf8' });
+  assert.equal(packed.status, 0, packed.stderr);
+  const archive = fs.readFileSync(path.join(home, 'sshway-0.9.0.tgz'));
+  let checksum = require('node:crypto').createHash('sha256').update(archive).digest('hex');
+
+  const http = require('node:http');
+  const server = http.createServer((request, response) => {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    if (request.url === '/latest') {
+      response.end(JSON.stringify({ tag_name: 'v0.9.0', assets: [
+        { name: 'sshway-0.9.0.tgz', browser_download_url: `${base}/a.tgz` },
+        { name: 'sshway-0.9.0.tgz.sha256', browser_download_url: `${base}/a.sha256` },
+      ] }));
+    } else if (request.url === '/a.tgz') response.end(archive);
+    else if (request.url === '/a.sha256') response.end(`${checksum}  sshway-0.9.0.tgz\n`);
+    else response.writeHead(404).end();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const prefix = path.join(home, 'prefix');
+  const env = {
+    ...process.env, HOME: home, npm_config_prefix: prefix, npm_config_update_notifier: 'false',
+    PATH: `${path.join(prefix, 'bin')}:${process.env.PATH}`,
+    SSHWAY_RELEASES_URL: `http://127.0.0.1:${server.address().port}/latest`,
+  };
+  const cli = path.join(installed, 'bin/sshway.js');
+  checksum = '0'.repeat(64);
+  const bad = await execCli(cli, ['update'], env);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /Checksum mismatch/);
+  assert.equal(fs.existsSync(prefix), false);
+
+  checksum = require('node:crypto').createHash('sha256').update(archive).digest('hex');
+  const updated = await execCli(cli, ['update'], env);
+  assert.equal(updated.status, 0, updated.stderr);
+  assert.match(updated.stdout, /Updated sshway 0\.1\.0 to 0\.9\.0\./);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(prefix, 'lib/node_modules/sshway/package.json'), 'utf8')).version, '0.9.0');
+  assert.match((await execCli(path.join(prefix, 'lib/node_modules/sshway/bin/sshway.js'), ['update'], env)).stdout, /already the newest/);
+});

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 const { spawnSync } = require('node:child_process');
-const { add, ensureProbe, list, locations, remove, set, shareHostKey, shortcut } = require('../lib/hosts');
+const path = require('node:path');
+const { add, ensureProbe, list, locations, refresh, remove, set, shareHostKey, shortcut } = require('../lib/hosts');
 const { currentNetwork, runProbe, status } = require('../lib/route');
+const { update } = require('../lib/update');
 
 function usage() {
   console.log(`sshway: memorable names for standard SSH connections
@@ -15,6 +17,8 @@ Usage:
   sshway shortcut <name>
   sshway remove <name>
   sshway network
+  sshway update
+  sshway refresh
 
 Options:
   --port <number>      SSH port
@@ -26,7 +30,8 @@ Options:
   --no-reuse           stop reusing connections
 
 After add, standard SSH works too: ssh <name>.
-Run shortcut to create a one-word command in ~/.local/bin.`);
+Run shortcut to create a one-word command in ~/.local/bin.
+update installs the newest sshway; refresh rewrites its SSH config and shortcuts.`);
 }
 
 function parseOptions(args, { clear = false } = {}) {
@@ -119,6 +124,19 @@ async function main(args) {
     const network = currentNetwork(ensureProbe());
     if (!network) throw new Error('Cannot identify this network.');
     console.log(network);
+    return 0;
+  }
+  if (command === 'update') {
+    if (rest.length) throw new Error('update takes no arguments.');
+    const { before, after } = await update(path.resolve(__dirname, '..'));
+    console.log(before === after ? `sshway ${after} is already the newest version.` : `Updated sshway ${before} to ${after}.`);
+    return 0;
+  }
+  if (command === 'refresh') {
+    if (rest.length) throw new Error('refresh takes no arguments.');
+    const { hosts, upgraded } = refresh();
+    console.log(`Refreshed SSH config for ${hosts} host${hosts === 1 ? '' : 's'}.`);
+    if (upgraded.length) console.log(`Upgraded shortcuts: ${upgraded.join(', ')}.`);
     return 0;
   }
   if (command === 'remove') {
