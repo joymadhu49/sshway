@@ -238,6 +238,14 @@ function execCli(file, args, env) {
   });
 }
 
+test('refresh leaves a machine without saved hosts untouched', t => {
+  const { home, run } = workspace(t);
+  const result = run('refresh');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Refreshed SSH config for 0 hosts\./);
+  assert.equal(fs.existsSync(path.join(home, '.ssh')), false);
+});
+
 test('update pulls a linked git checkout and refreshes old shortcuts', async t => {
   const { home } = workspace(t);
   const git = (cwd, ...args) => {
