@@ -91,3 +91,134 @@ test('refuses to replace a symlinked SSH config', t => {
   assert.equal(run('add', 'mini', 'alex@mini.example.com').status, 1);
   assert.equal(fs.readFileSync(original, 'utf8'), 'Host original\n    HostName original.example.com\n');
 });
+
+// Fake route/arp/nc let the LAN probe run anywhere; FAKE_MAC and FAKE_NC choose the network and reachability.
+function fakeNetwork(home) {
+  const bin = path.join(home, 'fake-net');
+  fs.mkdirSync(bin);
+  const tools = {
+    uname: 'echo Darwin',
+    route: 'echo "    gateway: 10.0.0.1"',
+    arp: 'echo "? (10.0.0.1) at ${FAKE_MAC:-4e:5d:6a:1:88:64} on en0 ifscope [ethernet]"',
+    nc: 'echo "$@" >> "$HOME/nc.log"; exit ${FAKE_NC:-0}',
+  };
+  for (const [name, body] of Object.entries(tools)) fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return (extra = {}) => ({ ...process.env, HOME: home, SHELL: '/bin/sh', PATH: `${bin}:${process.env.PATH}`, ...extra });
+}
+
+function resolvedHost(home, env, name) {
+  const main = path.join(home, 'absolute-config');
+  fs.writeFileSync(main, `Include ${path.join(home, '.ssh/sshway/config')}\nHost other\n    HostName other.example.com\n`);
+  const result = spawnSync('ssh', ['-F', main, '-G', name], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout;
+}
+
+test('lan routing uses the LAN address only on the home network when it answers', t => {
+  const { home, run } = workspace(t);
+  const env = fakeNetwork(home);
+  assert.equal(run('add', 'mini', 'joy@mini.tail1234.ts.net', '--lan', '192.168.50.119', '--network', '4E:5D:6A:01:88:64').status, 0);
+  const config = fs.readFileSync(path.join(home, '.ssh/sshway/config'), 'utf8');
+  assert.match(config, /^Match originalhost mini exec "sh ~\/\.ssh\/sshway\/probe 192\.168\.50\.119 22 4e:5d:6a:01:88:64"\n    HostName 192\.168\.50\.119$/m);
+  assert.equal(fs.statSync(path.join(home, '.ssh/sshway/probe')).mode & 0o777, 0o700);
+
+  const atHome = resolvedHost(home, env(), 'mini');
+  assert.match(atHome, /^hostname 192\.168\.50\.119$/m);
+  assert.match(atHome, /^hostkeyalias mini$/m);
+  assert.match(atHome, /^user joy$/m);
+  assert.match(resolvedHost(home, env({ FAKE_MAC: '10:7c:61:9a:bf:98' }), 'mini'), /^hostname mini\.tail1234\.ts\.net$/m);
+  assert.match(resolvedHost(home, env({ FAKE_NC: '1' }), 'mini'), /^hostname mini\.tail1234\.ts\.net$/m);
+
+  fs.rmSync(path.join(home, 'nc.log'));
+  assert.match(resolvedHost(home, env(), 'other'), /^hostname other\.example\.com$/m);
+  assert.equal(fs.existsSync(path.join(home, 'nc.log')), false, 'other hosts must not run the probe');
+});
+
+test('add detects the current network and refuses a LAN address that does not answer', t => {
+  const { home } = workspace(t);
+  const env = fakeNetwork(home);
+  const run = (extra, ...args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env: env(extra) });
+  const failed = run({ FAKE_NC: '1' }, 'add', 'mini', 'joy@mini.example.com', '--lan', '192.168.50.119');
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /Cannot reach 192\.168\.50\.119:22/);
+  assert.equal(fs.existsSync(path.join(home, '.ssh/sshway/hosts.json')), false);
+
+  const added = run({}, 'add', 'mini', 'joy@mini.example.com', '--lan', '192.168.50.119', '--port', '2222');
+  assert.equal(added.status, 0, added.stderr);
+  const saved = JSON.parse(fs.readFileSync(path.join(home, '.ssh/sshway/hosts.json'), 'utf8')).mini;
+  assert.equal(saved.network, '4e:5d:6a:01:88:64');
+  assert.match(fs.readFileSync(path.join(home, 'nc.log'), 'utf8'), /192\.168\.50\.119 2222/);
+  assert.equal(run({}, 'network').stdout, '4e:5d:6a:01:88:64\n');
+  assert.match(run({}, 'list').stdout, /^mini\tjoy@mini\.example\.com:2222\thome 192\.168\.50\.119$/m);
+});
+
+test('set toggles reuse and LAN routing on an existing host', t => {
+  const { home, run } = workspace(t);
+  assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
+  assert.equal(run('set', 'mini', '--reuse', '--lan', '10.0.0.5', '--network', 'aa:bb:cc:dd:ee:ff').status, 0);
+  let config = fs.readFileSync(path.join(home, '.ssh/sshway/config'), 'utf8');
+  assert.match(config, /ControlMaster auto\n    ControlPath ~\/\.ssh\/sshway\/sockets\/%C\n    ControlPersist 10m/);
+  assert.match(config, /^Match originalhost mini exec/m);
+  assert.equal(fs.statSync(path.join(home, '.ssh/sshway/sockets')).mode & 0o777, 0o700);
+  assert.match(run('list').stdout, /^mini\tjoy@mini\.example\.com\thome 10\.0\.0\.5\treuse$/m);
+
+  assert.equal(run('set', 'mini', '--no-lan', '--no-reuse').status, 0);
+  config = fs.readFileSync(path.join(home, '.ssh/sshway/config'), 'utf8');
+  assert.doesNotMatch(config, /Match|Control|HostKeyAlias/);
+  assert.equal(run('set', 'mini', '--network', 'aa:bb:cc:dd:ee:ff').status, 1);
+  assert.equal(run('set', 'mini', '--lan', 'not-an-ip', '--network', 'aa:bb:cc:dd:ee:ff').status, 1);
+  assert.equal(run('set', 'mini', '--lan', '10.0.0.5', '--network', 'aa:bb:cc"\nProxyCommand x').status, 1);
+});
+
+test('lan routing shares the trusted host key with the alias', t => {
+  const { home, run } = workspace(t);
+  const key = path.join(home, 'key');
+  assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', key]).status, 0);
+  const publicKey = fs.readFileSync(`${key}.pub`, 'utf8').split(' ').slice(0, 2).join(' ');
+  fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+  const known = path.join(home, '.ssh/known_hosts');
+  fs.writeFileSync(known, `mini.example.com ${publicKey}\n`, { mode: 0o600 });
+  const added = run('add', 'mini', 'joy@mini.example.com', '--lan', '10.0.0.5', '--network', 'aa:bb:cc:dd:ee:ff');
+  assert.equal(added.status, 0, added.stderr);
+  assert.match(added.stdout, /Copied the trusted host key/);
+  assert.equal(fs.readFileSync(known, 'utf8'), `mini.example.com ${publicKey}\nmini ${publicKey}\n`);
+  assert.equal(run('set', 'mini', '--reuse').status, 0);
+  assert.equal(fs.readFileSync(known, 'utf8').split('\n').filter(Boolean).length, 2);
+});
+
+test('shortcut upgrades and removes shortcuts from earlier versions', t => {
+  const { home, run } = workspace(t);
+  assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
+  const target = path.join(home, '.local/bin/mini');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, '#!/bin/sh\n# sshway managed shortcut\nexec ssh mini "$@"\n', { mode: 0o755 });
+  assert.equal(run('shortcut', 'mini').status, 0);
+  assert.match(fs.readFileSync(target, 'utf8'), /ssh -G mini/);
+  fs.writeFileSync(target, '#!/bin/sh\n# sshway managed shortcut\nexec ssh mini "$@"\n', { mode: 0o755 });
+  assert.equal(run('remove', 'mini').status, 0);
+  assert.equal(fs.existsSync(target), false);
+});
+
+test('status reports the route and connect time', async t => {
+  const { home, run } = workspace(t);
+  const net = require('node:net');
+  const server = net.createServer(socket => socket.end());
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  assert.equal(run('add', 'local', 'joy@127.0.0.1', '--port', String(server.address().port)).status, 0);
+  // ssh reads the account's real ~/.ssh/config, so point it at this workspace's config instead.
+  const main = path.join(home, 'absolute-config');
+  fs.writeFileSync(main, `Include ${path.join(home, '.ssh/sshway/config')}\n`);
+  const realSsh = spawnSync('sh', ['-c', 'command -v ssh'], { encoding: 'utf8' }).stdout.trim();
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh\nexec ${realSsh} -F ${main} "$@"\n`, { mode: 0o755 });
+  const result = await new Promise(resolve => {
+    require('node:child_process').execFile(process.execPath, [cli, 'status', 'local'], {
+      env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
+  });
+  assert.equal(result.error, null, result.stderr);
+  assert.match(result.stdout, new RegExp(`^Route: 127\\.0\\.0\\.1 port ${server.address().port}$`, 'm'));
+  assert.match(result.stdout, /^Reachable: TCP connect in \d+ ms\.$/m);
+});

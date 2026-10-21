@@ -1,6 +1,6 @@
 {
   "name": "sshway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Give SSH hosts memorable names and optional one-word commands",
   "license": "MIT",
   "type": "commonjs",
