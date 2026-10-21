@@ -4,7 +4,7 @@
 
 Give SSH connections memorable names. `sshway` writes ordinary OpenSSH configuration, so the names also work with `ssh`, `scp`, `sftp`, Git, and tools that use SSH.
 
-It supports macOS and Linux. It needs Node.js 22 or newer to manage hosts, plus OpenSSH to connect. It has no runtime npm dependencies, server, account, or password store. Tailscale is optional; a DNS name or IP address also works.
+It supports macOS, Linux, and Windows. It needs Node.js 22 or newer to manage hosts, plus OpenSSH to connect. Windows 10 and 11 include the OpenSSH client. It has no runtime npm dependencies, server, account, or password store. Tailscale is optional; a DNS name or IP address also works.
 
 ## Install
 
@@ -114,9 +114,17 @@ sshway --help
 
 `remove` also deletes the one-word command if `sshway` created it. For all SSH options, use native SSH directly, such as `ssh -L 8080:localhost:8080 mini`.
 
+## Windows
+
+Everything above works in PowerShell or Command Prompt, with these differences:
+
+- `sshway shortcut mini` creates `%USERPROFILE%\.local\bin\mini.cmd`. If that folder is not on your `PATH`, `sshway` prints the PowerShell command that adds it.
+- OpenSSH for Windows runs `Match exec` through `cmd.exe` and does not accept quoted paths there, so LAN routing calls `sshway probe` from your `PATH` instead of a shell script. Keep `sshway` installed globally. The check adds roughly 0.1 seconds to each connection.
+- OpenSSH for Windows cannot reuse connections, so `--reuse` is not available.
+
 ## How it works
 
-`sshway` inserts one `Include ~/.ssh/sshway/config` line at the top of `~/.ssh/config`, preserving the rest of that file. Its own host entries are stored in `~/.ssh/sshway/config`; its data is stored in `~/.ssh/sshway/hosts.json`. LAN routing adds an OpenSSH `Match exec` block that runs the small shell script `~/.ssh/sshway/probe`, and connection reuse keeps its sockets in `~/.ssh/sshway/sockets`. When LAN routing is turned on, `sshway` copies any key you already trust for the main address to an entry under the host's name in `~/.ssh/known_hosts`. These files are readable only by your user. It never changes the remote machine or installs a daemon. The probe needs `nc` to check the LAN address; without it, the LAN address is used whenever you are on the home network.
+`sshway` inserts one `Include ~/.ssh/sshway/config` line at the top of `~/.ssh/config`, preserving the rest of that file. Its own host entries are stored in `~/.ssh/sshway/config`; its data is stored in `~/.ssh/sshway/hosts.json`. LAN routing adds an OpenSSH `Match exec` block that runs the small shell script `~/.ssh/sshway/probe` (`sshway probe` on Windows), and connection reuse keeps its sockets in `~/.ssh/sshway/sockets`. When LAN routing is turned on, `sshway` copies any key you already trust for the main address to an entry under the host's name in `~/.ssh/known_hosts`. These files are readable only by your user. It never changes the remote machine or installs a daemon. The probe needs `nc` to check the LAN address; without it, the LAN address is used whenever you are on the home network.
 
 OpenSSH reads the first value it finds for most settings. Putting the managed include first makes the saved host name take precedence. Choose a name that does not conflict with an existing SSH host or local command.
 

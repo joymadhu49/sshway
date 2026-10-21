@@ -2,7 +2,7 @@
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 const { add, ensureProbe, list, locations, refresh, remove, set, shareHostKey, shortcut } = require('../lib/hosts');
-const { currentNetwork, runProbe, status } = require('../lib/route');
+const { currentNetwork, probeLan, status, windows } = require('../lib/route');
 const { update } = require('../lib/update');
 
 function usage() {
@@ -26,7 +26,7 @@ Options:
   --lan <ip>           use this address when on the host's home network
   --network <mac>      home router MAC address (detected when omitted)
   --no-lan             always use the main host address
-  --reuse              keep connections open for 10 minutes for instant reconnects
+  --reuse              keep connections open for 10 minutes (not on Windows)
   --no-reuse           stop reusing connections
 
 After add, standard SSH works too: ssh <name>.
@@ -39,7 +39,10 @@ function parseOptions(args, { clear = false } = {}) {
   const options = {};
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
-    if (flag === '--reuse') options.reuse = true;
+    if (flag === '--reuse') {
+      if (windows) throw new Error('OpenSSH for Windows cannot reuse connections, so --reuse is not available.');
+      options.reuse = true;
+    }
     else if (clear && flag === '--no-reuse') options.reuse = null;
     else if (clear && flag === '--no-lan') options.lan = options.network = null;
     else if (Object.hasOwn(values, flag)) {
@@ -52,12 +55,12 @@ function parseOptions(args, { clear = false } = {}) {
 }
 
 // Without --network, record the network we are on, but only after proving the LAN address answers here.
-function detectNetwork(options, port) {
+async function detectNetwork(options, port) {
   if (!options.lan || options.network) return;
   const probe = ensureProbe();
   const network = currentNetwork(probe);
   if (!network) throw new Error('Cannot identify this network. Pass --network <router MAC>.');
-  if (runProbe(probe, [options.lan, String(port || 22), network]).status !== 0) {
+  if (!await probeLan(probe, options.lan, Number(port || 22), network)) {
     throw new Error(`Cannot reach ${options.lan}:${port || 22} from this network. Run this on the host's home network, or pass --network with that router's MAC address (sshway network prints it).`);
   }
   options.network = network;
@@ -85,7 +88,7 @@ async function main(args) {
     const [name, destination, ...flags] = rest;
     if (!name || !destination) throw new Error('Expected a name and [user@]host.');
     const options = parseOptions(flags);
-    detectNetwork(options, options.port);
+    await detectNetwork(options, options.port);
     describe(name, add(name, destination, options));
     console.log(`Saved ${name}. Connect with ssh ${name}.`);
     return 0;
@@ -96,7 +99,7 @@ async function main(args) {
     const options = parseOptions(flags, { clear: true });
     const existing = list()[name];
     if (!existing) throw new Error('Unknown host. Use sshway list.');
-    detectNetwork(options, options.port || existing.port);
+    await detectNetwork(options, options.port || existing.port);
     describe(name, set(name, options));
     console.log(`Updated ${name}.`);
     return 0;
@@ -118,6 +121,12 @@ async function main(args) {
     ensureProbe();
     for (const line of await status(rest[0], item, locations())) console.log(line);
     return 0;
+  }
+  if (command === 'probe') {
+    // Called by OpenSSH for Windows from the generated Match exec line.
+    const [lan, port, network] = rest;
+    if (rest.length !== 3) throw new Error('Expected <address> <port> <network>.');
+    return await probeLan(ensureProbe(), lan, Number(port), network) ? 0 : 1;
   }
   if (command === 'network') {
     if (rest.length) throw new Error('network takes no arguments.');
@@ -149,7 +158,10 @@ async function main(args) {
     if (rest.length !== 1) throw new Error('Expected one host name.');
     const result = shortcut(rest[0]);
     console.log(`Created ${result.path}. Run ${rest[0]} to connect.`);
-    if (!result.onPath) console.log('Add ~/.local/bin to PATH, then open a new terminal.');
+    if (!result.onPath && windows) {
+      console.log('Add it to your PATH once in PowerShell, then open a new terminal:');
+      console.log(`  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';${path.dirname(result.path)}', 'User')`);
+    } else if (!result.onPath) console.log('Add ~/.local/bin to PATH, then open a new terminal.');
     return 0;
   }
   if (command === 'connect') {

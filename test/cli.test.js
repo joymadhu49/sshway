@@ -6,15 +6,17 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const cli = path.resolve(__dirname, '../bin/sshway.js');
+const windows = process.platform === 'win32';
+const posixOnly = { skip: windows && 'uses POSIX shell scripts' };
+// OpenSSH reads backslashes in its config as escapes.
+const sshPath = file => file.replaceAll('\\', '/');
 
 function workspace(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sshway-test-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const run = (...args) => spawnSync(process.execPath, [cli, ...args], {
-    encoding: 'utf8',
-    env: { ...process.env, HOME: home },
-  });
-  return { home, run };
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const run = (...args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env });
+  return { home, run, env };
 }
 
 test('add creates native SSH config and preserves existing entries', t => {
@@ -26,11 +28,13 @@ test('add creates native SSH config and preserves existing entries', t => {
   const main = fs.readFileSync(path.join(home, '.ssh/config'), 'utf8');
   assert.match(main, /^Include ~\/\.ssh\/sshway\/config/);
   assert.match(main, /Host old\n    HostName old.example.com/);
-  assert.equal(fs.statSync(path.join(home, '.ssh/sshway/config')).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(path.join(home, '.ssh/sshway/hosts.json')).mode & 0o777, 0o600);
-  // ssh expands ~ from the account database, not the HOME override used by this test.
+  if (!windows) {
+    assert.equal(fs.statSync(path.join(home, '.ssh/sshway/config')).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(home, '.ssh/sshway/hosts.json')).mode & 0o777, 0o600);
+  }
+  // ssh reads the account's own ~/.ssh/config, so point it at this workspace's file.
   const absoluteMain = path.join(home, 'absolute-config');
-  fs.writeFileSync(absoluteMain, main.replace('Include ~/.ssh/sshway/config', `Include ${path.join(home, '.ssh/sshway/config')}`));
+  fs.writeFileSync(absoluteMain, main.replace('Include ~/.ssh/sshway/config', `Include ${sshPath(path.join(home, '.ssh/sshway/config'))}`));
   const resolved = spawnSync('ssh', ['-F', absoluteMain, '-G', 'mini'], { encoding: 'utf8' });
   assert.equal(resolved.status, 0, resolved.stderr);
   assert.match(resolved.stdout, /^hostname mini.example.com$/m);
@@ -55,7 +59,7 @@ test('rejects config injection and invalid port without changing SSH config', t 
   assert.equal(fs.readFileSync(file, 'utf8'), before);
 });
 
-test('shortcut runs SSH and remove deletes only its own shortcut', t => {
+test('shortcut runs SSH and remove deletes only its own shortcut', posixOnly, t => {
   const { home, run } = workspace(t);
   assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
   assert.equal(run('shortcut', 'mini').status, 0);
@@ -74,14 +78,34 @@ test('shortcut runs SSH and remove deletes only its own shortcut', t => {
   assert.equal(run('list').stdout.trim(), 'No saved hosts. Use sshway add.');
 });
 
+test('Windows shortcut is a cmd file that passes arguments to SSH', { skip: !windows && 'Windows only' }, t => {
+  const { home, run, env } = workspace(t);
+  assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
+  assert.equal(run('shortcut', 'mini').status, 0);
+  const shortcut = path.join(home, '.local/bin/mini.cmd');
+  assert.match(fs.readFileSync(shortcut, 'utf8'), /^@echo off\r\nrem sshway managed shortcut\r\nssh mini %\*\r\n$/);
+  const fakeBin = path.join(home, 'fake-bin');
+  fs.mkdirSync(fakeBin);
+  fs.writeFileSync(path.join(fakeBin, 'ssh.cmd'), '@echo %*\r\n');
+  const invoked = spawnSync('cmd.exe', ['/d', '/c', shortcut, 'uptime'], { encoding: 'utf8', env: { ...env, PATH: `${fakeBin};${env.PATH}` } });
+  assert.equal(invoked.status, 0, invoked.stderr);
+  assert.equal(invoked.stdout.trim(), 'mini uptime');
+  assert.equal(run('remove', 'mini').status, 0);
+  assert.equal(fs.existsSync(shortcut), false);
+  const reuse = run('add', 'other', 'joy@other.example.com', '--reuse');
+  assert.equal(reuse.status, 1);
+  assert.match(reuse.stderr, /cannot reuse connections/);
+});
+
 test('shortcut refuses to shadow another command', t => {
   const { home, run } = workspace(t);
   assert.equal(run('add', 'node', 'joy@mini.example.com').status, 0);
   assert.equal(run('shortcut', 'node').status, 1);
   assert.equal(fs.existsSync(path.join(home, '.local/bin/node')), false);
+  assert.equal(fs.existsSync(path.join(home, '.local/bin/node.cmd')), false);
 });
 
-test('refuses to replace a symlinked SSH config', t => {
+test('refuses to replace a symlinked SSH config', posixOnly, t => {
   const { home, run } = workspace(t);
   const ssh = path.join(home, '.ssh');
   fs.mkdirSync(ssh);
@@ -114,7 +138,7 @@ function resolvedHost(home, env, name) {
   return result.stdout;
 }
 
-test('lan routing uses the LAN address only on the home network when it answers', t => {
+test('lan routing uses the LAN address only on the home network when it answers', posixOnly, t => {
   const { home, run } = workspace(t);
   const env = fakeNetwork(home);
   assert.equal(run('add', 'mini', 'joy@mini.tail1234.ts.net', '--lan', '192.168.50.119', '--network', '4E:5D:6A:01:88:64').status, 0);
@@ -134,7 +158,7 @@ test('lan routing uses the LAN address only on the home network when it answers'
   assert.equal(fs.existsSync(path.join(home, 'nc.log')), false, 'other hosts must not run the probe');
 });
 
-test('add detects the current network and refuses a LAN address that does not answer', t => {
+test('add detects the current network and refuses a LAN address that does not answer', posixOnly, t => {
   const { home } = workspace(t);
   const env = fakeNetwork(home);
   const run = (extra, ...args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env: env(extra) });
@@ -152,7 +176,7 @@ test('add detects the current network and refuses a LAN address that does not an
   assert.match(run({}, 'list').stdout, /^mini\tjoy@mini\.example\.com:2222\thome 192\.168\.50\.119$/m);
 });
 
-test('set toggles reuse and LAN routing on an existing host', t => {
+test('set toggles reuse and LAN routing on an existing host', posixOnly, t => {
   const { home, run } = workspace(t);
   assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
   assert.equal(run('set', 'mini', '--reuse', '--lan', '10.0.0.5', '--network', 'aa:bb:cc:dd:ee:ff').status, 0);
@@ -186,7 +210,7 @@ test('lan routing shares the trusted host key with the alias', t => {
   assert.equal(fs.readFileSync(known, 'utf8').split('\n').filter(Boolean).length, 2);
 });
 
-test('shortcut upgrades and removes shortcuts from earlier versions', t => {
+test('shortcut upgrades and removes shortcuts from earlier versions', posixOnly, t => {
   const { home, run } = workspace(t);
   assert.equal(run('add', 'mini', 'joy@mini.example.com').status, 0);
   const target = path.join(home, '.local/bin/mini');
@@ -199,7 +223,7 @@ test('shortcut upgrades and removes shortcuts from earlier versions', t => {
   assert.equal(fs.existsSync(target), false);
 });
 
-test('status reports the route and connect time', async t => {
+test('status reports the route and connect time', posixOnly, async t => {
   const { home, run } = workspace(t);
   const net = require('node:net');
   const server = net.createServer(socket => socket.end());
@@ -262,12 +286,14 @@ test('update pulls a linked git checkout and refreshes old shortcuts', async t =
   copyPackage(origin, '0.9.0');
   git(origin, 'commit', '-qam', 'new');
 
-  const env = { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1' };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_NOSYSTEM: '1' };
   const cli = path.join(checkout, 'bin/sshway.js');
   assert.equal(spawnSync(process.execPath, [cli, 'add', 'mini', 'joy@mini.example.com'], { env }).status, 0);
   const shortcut = path.join(home, '.local/bin/mini');
-  fs.mkdirSync(path.dirname(shortcut), { recursive: true });
-  fs.writeFileSync(shortcut, '#!/bin/sh\n# sshway managed shortcut\nexec ssh mini "$@"\n', { mode: 0o755 });
+  if (!windows) {
+    fs.mkdirSync(path.dirname(shortcut), { recursive: true });
+    fs.writeFileSync(shortcut, '#!/bin/sh\n# sshway managed shortcut\nexec ssh mini "$@"\n', { mode: 0o755 });
+  }
 
   fs.appendFileSync(path.join(checkout, 'README.md'), 'local edit\n');
   const dirty = await execCli(cli, ['update'], env);
@@ -277,9 +303,11 @@ test('update pulls a linked git checkout and refreshes old shortcuts', async t =
 
   const updated = await execCli(cli, ['update'], env);
   assert.equal(updated.status, 0, updated.stderr);
-  assert.match(updated.stdout, /Upgraded shortcuts: mini\./);
   assert.match(updated.stdout, /Updated sshway 0\.1\.0 to 0\.9\.0\./);
-  assert.match(fs.readFileSync(shortcut, 'utf8'), /ssh -G mini/);
+  if (!windows) {
+    assert.match(updated.stdout, /Upgraded shortcuts: mini\./);
+    assert.match(fs.readFileSync(shortcut, 'utf8'), /ssh -G mini/);
+  }
   assert.match((await execCli(cli, ['update'], env)).stdout, /0\.9\.0 is already the newest version/);
 });
 
@@ -289,7 +317,9 @@ test('update installs a verified release archive', async t => {
   copyPackage(installed, '0.1.0');
   const source = path.join(home, 'source');
   copyPackage(source, '0.9.0');
-  const packed = spawnSync('npm', ['pack', '--silent', '--pack-destination', home], { cwd: source, encoding: 'utf8' });
+  const packed = windows
+    ? spawnSync(`npm pack --silent --pack-destination "${home}"`, { cwd: source, encoding: 'utf8', shell: true })
+    : spawnSync('npm', ['pack', '--silent', '--pack-destination', home], { cwd: source, encoding: 'utf8' });
   assert.equal(packed.status, 0, packed.stderr);
   const archive = fs.readFileSync(path.join(home, 'sshway-0.9.0.tgz'));
   let checksum = require('node:crypto').createHash('sha256').update(archive).digest('hex');
@@ -310,9 +340,11 @@ test('update installs a verified release archive', async t => {
   t.after(() => server.close());
 
   const prefix = path.join(home, 'prefix');
+  // npm puts global packages in prefix/node_modules and commands in prefix on Windows.
+  const installedRoot = path.join(prefix, windows ? '' : 'lib', 'node_modules/sshway');
   const env = {
-    ...process.env, HOME: home, npm_config_prefix: prefix, npm_config_update_notifier: 'false',
-    PATH: `${path.join(prefix, 'bin')}:${process.env.PATH}`,
+    ...process.env, HOME: home, USERPROFILE: home, npm_config_prefix: prefix, npm_config_update_notifier: 'false',
+    PATH: `${windows ? prefix : path.join(prefix, 'bin')}${path.delimiter}${process.env.PATH}`,
     SSHWAY_RELEASES_URL: `http://127.0.0.1:${server.address().port}/latest`,
   };
   const cli = path.join(installed, 'bin/sshway.js');
@@ -326,6 +358,63 @@ test('update installs a verified release archive', async t => {
   const updated = await execCli(cli, ['update'], env);
   assert.equal(updated.status, 0, updated.stderr);
   assert.match(updated.stdout, /Updated sshway 0\.1\.0 to 0\.9\.0\./);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(prefix, 'lib/node_modules/sshway/package.json'), 'utf8')).version, '0.9.0');
-  assert.match((await execCli(path.join(prefix, 'lib/node_modules/sshway/bin/sshway.js'), ['update'], env)).stdout, /already the newest/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(installedRoot, 'package.json'), 'utf8')).version, '0.9.0');
+  assert.match((await execCli(path.join(installedRoot, 'bin/sshway.js'), ['update'], env)).stdout, /already the newest/);
+});
+
+test('parses Windows route and arp output', () => {
+  const { parseRoute, parseArp, normalizeMac } = require('../lib/route');
+  const route = [
+    'IPv4 Route Table',
+    '===========================================================================',
+    'Active Routes:',
+    'Network Destination        Netmask          Gateway       Interface  Metric',
+    '          0.0.0.0          0.0.0.0      192.168.8.1    192.168.8.20     55',
+    '          0.0.0.0          0.0.0.0     192.168.50.1  192.168.50.155     25',
+    '===========================================================================',
+    'Persistent Routes:',
+    '  Network Address          Netmask  Gateway Address  Metric',
+    '          0.0.0.0          0.0.0.0         10.9.9.1  Default',
+  ].join('\r\n');
+  assert.equal(parseRoute(route), '192.168.50.1');
+  assert.equal(parseRoute('Active Routes:\r\nNone\r\n'), null);
+  const arp = '\r\nInterface: 192.168.50.155 --- 0xe\r\n  Internet Address      Physical Address      Type\r\n  192.168.50.1          10-7c-61-9a-bf-98     dynamic   \r\n';
+  assert.equal(parseArp(arp, '192.168.50.1'), '10:7c:61:9a:bf:98');
+  assert.equal(parseArp('No ARP Entries Found.\r\n', '192.168.50.1'), null);
+  assert.equal(normalizeMac('4E:5D:6A:1:88:64'), '4e:5d:6a:01:88:64');
+  assert.equal(normalizeMac('incomplete'), null);
+});
+
+test('Windows LAN routing goes through sshway probe on PATH', { skip: !windows && 'Windows only' }, async t => {
+  const { home, run, env } = workspace(t);
+  const network = run('network');
+  assert.equal(network.status, 0, network.stderr);
+  const here = network.stdout.trim();
+  assert.match(here, /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/);
+
+  const net = require('node:net');
+  const server = net.createServer(socket => socket.end());
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const added = run('add', 'mini', 'joy@mini.example.com', '--port', String(port), '--lan', '127.0.0.1');
+  assert.equal(added.status, 0, added.stderr);
+  const config = fs.readFileSync(path.join(home, '.ssh/sshway/config'), 'utf8');
+  assert.match(config, new RegExp(`^Match originalhost mini exec "sshway probe 127\\.0\\.0\\.1 ${port} ${here}"$`, 'm'));
+
+  // OpenSSH for Windows finds sshway through PATH, as it would after a global install.
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'sshway.cmd'), `@"${process.execPath}" "${cli}" %*\r\n`);
+  const main = path.join(home, 'absolute-config');
+  fs.writeFileSync(main, `Include ${sshPath(path.join(home, '.ssh/sshway/config'))}\n`);
+  const resolve = () => {
+    const result = spawnSync('ssh', ['-F', main, '-G', 'mini'], { encoding: 'utf8', env: { ...env, PATH: `${bin};${env.PATH}` } });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.match(/^hostname (.+)$/m)[1];
+  };
+  assert.equal(resolve(), '127.0.0.1');
+  await new Promise(resolve => server.close(resolve));
+  assert.equal(resolve(), 'mini.example.com');
+  assert.equal(run('set', 'mini', '--lan', '127.0.0.1', '--network', 'aa:bb:cc:dd:ee:ff').status, 0);
+  assert.equal(resolve(), 'mini.example.com');
 });
